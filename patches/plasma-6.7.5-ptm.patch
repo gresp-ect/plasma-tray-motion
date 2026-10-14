@@ -1,0 +1,987 @@
+diff --git a/applets/systemtray/CMakeLists.txt b/applets/systemtray/CMakeLists.txt
+index c670340..fa6070c 100644
+--- a/applets/systemtray/CMakeLists.txt
++++ b/applets/systemtray/CMakeLists.txt
+@@ -56,8 +56,10 @@ set_property(TARGET systemtray_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+ plasma_add_applet(org.kde.plasma.systemtray
+     CPP_SOURCES
++        ptmdroprouter.cpp ptmdroprouter.h
+         systemtray.cpp
+     QML_SOURCES
++        qml/PtmController.qml
+         qml/AbstractItem.qml
+         qml/BackgroundAppItem.qml
+         qml/ConfigGeneral.qml
+diff --git a/applets/systemtray/main.xml b/applets/systemtray/main.xml
+index 78e4855..01f7f74 100644
+--- a/applets/systemtray/main.xml
++++ b/applets/systemtray/main.xml
+@@ -6,6 +6,11 @@
+   <kcfgfile name=""/>
+ 
+   <group name="General">
++    <entry name="ptmEnabled" type="Bool"><default>true</default></entry>
++    <entry name="ptmHoldMs" type="Int"><default>180</default><min>100</min><max>1500</max></entry>
++    <entry name="ptmAnimationMs" type="Int"><default>160</default><min>0</min><max>500</max></entry>
++    <entry name="ptmItemOrder" type="StringList"><default></default></entry>
++    <entry name="ptmMigrated" type="Bool"><default>false</default></entry>
+     <entry name="extraItems" type="StringList">
+       <label>All plasmoid items that are explicitly enabled in the systray. It's a comma-separated string list of plasmoid plugin ids.</label>
+       <default></default>
+diff --git a/applets/systemtray/ptmdroprouter.cpp b/applets/systemtray/ptmdroprouter.cpp
+new file mode 100644
+index 0000000..4de94e0
+--- /dev/null
++++ b/applets/systemtray/ptmdroprouter.cpp
+@@ -0,0 +1,164 @@
++// SPDX-FileCopyrightText: 2026 Plasma Tray Motion contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "ptmdroprouter.h"
++#include <QDrag>
++#include <QGuiApplication>
++#include <QPainter>
++#include <QRasterWindow>
++#include <QtGui/private/qpaintdevicewindow_p.h>
++#include <QDebug>
++#include <QDragEnterEvent>
++#include <QDropEvent>
++#include <QMimeData>
++#include <QPixmap>
++#include <QQuickItem>
++#include <QQuickItemGrabResult>
++#include <QQuickWindow>
++
++static const char s_mime[] = "application/x-plasma-tray-motion";
++
++PtmDropRouter::PtmDropRouter(QObject *parent) : QObject(parent) {}
++PtmDropRouter::~PtmDropRouter() { end(m_token); }
++
++bool PtmDropRouter::begin(QQuickItem *grid, const QString &token)
++{
++    if (m_nativeExecuting) return false;
++    end(m_token);
++    if (!grid || !grid->window() || token.isEmpty()) return false;
++    m_grid = grid;
++    m_window = grid->window();
++    m_token = token;
++    m_window->installEventFilter(this);
++    return true;
++}
++
++void PtmDropRouter::end(const QString &token)
++{
++    if (token != m_token) return;
++    if (m_imageWindow) {
++        m_imageWindow->removeEventFilter(this);
++        // An invalidated transaction no longer hides the drag image; return the transparent buffer to Qt for normal repainting.
++        if (m_nativeInside) m_imageWindow->update();
++    }
++    m_imageWindow.clear();
++    m_nativeInside = false;
++    if (m_window) m_window->removeEventFilter(this);
++    m_window.clear();
++    m_grid.clear();
++    m_token.clear();
++}
++
++int PtmDropRouter::runNativeDrag(QObject *imageResult, const QString &token)
++{
++    if (m_nativeExecuting) return int(Qt::IgnoreAction);
++    auto *grab = qobject_cast<QQuickItemGrabResult *>(imageResult);
++    if (!m_window || m_token != token || !grab || grab->image().isNull()) {
++        qWarning() << "[PTM] Native drag image unavailable; refusing to start a drag without an image";
++        return int(Qt::IgnoreAction);
++    }
++    // Use the completed pixel image directly,
++    // bypassing the QML grab URL and Qt Quick asynchronous image loader.
++    const QPixmap pixmap = QPixmap::fromImage(grab->image());
++    if (pixmap.isNull()) return int(Qt::IgnoreAction);
++    auto *drag = new QDrag(m_window);
++    auto *mime = new QMimeData;
++    mime->setData(QLatin1String(s_mime), token.toUtf8());
++    drag->setMimeData(mime);
++    drag->setPixmap(pixmap);
++    drag->setHotSpot(QPoint(-24, -24));
++    m_nativeExecuting = true;
++    Q_EMIT nativeDragPrepared(drag);
++    qInfo() << "[PTM] Native image size" << pixmap.size() << "device pixel ratio" << pixmap.devicePixelRatio();
++    // The Qt Wayland backend manages the drag operation;
++    // use the source window as the QObject parent, following the QDrag lifetime convention.
++    const int result = int(drag->exec(Qt::MoveAction, Qt::MoveAction));
++    m_nativeExecuting = false;
++    if (m_imageWindow) m_imageWindow->removeEventFilter(this);
++    m_imageWindow.clear();
++    m_nativeInside = false;
++    return result;
++}
++
++// The public QDrag API does not support replacing the image during exec().
++// Keep the Wayland surface and clear only the raster buffer inside the tray; this uses a Qt 6.11 private API,
++// with release compatibility restricted by exact Qt RPM matching.
++// Do not hide or destroy the window, which would disrupt its compositor drag role.
++void PtmDropRouter::clearNativeImage()
++{
++    if (!m_imageWindow || !m_imageWindow->isExposed()) return;
++    auto *device = static_cast<QPaintDeviceWindowPrivate *>(QWindowPrivate::get(m_imageWindow));
++    const QRegion region(QRect(QPoint(), m_imageWindow->size()));
++    device->beginPaint(region);
++    {
++        QPainter painter(m_imageWindow);
++        painter.setCompositionMode(QPainter::CompositionMode_Source);
++        painter.fillRect(QRect(QPoint(), m_imageWindow->size()), Qt::transparent);
++    }
++    device->endPaint();
++    device->flush(region);
++}
++
++void PtmDropRouter::updateNativeImage(bool inside)
++{
++    const bool changed = m_nativeInside != inside;
++    m_nativeInside = inside;
++    if (!m_nativeExecuting) return;
++    if (m_imageWindow && !changed) return;
++    if (!m_imageWindow) {
++        for (auto *window : QGuiApplication::allWindows()) {
++            if (window->inherits("QShapedPixmapWindow")) {
++                m_imageWindow = qobject_cast<QRasterWindow *>(window);
++                if (m_imageWindow) m_imageWindow->installEventFilter(this);
++                break;
++            }
++        }
++    }
++    if (!m_imageWindow) return;
++    if (inside) clearNativeImage();
++    else m_imageWindow->update();
++}
++
++bool PtmDropRouter::eventFilter(QObject *watched, QEvent *event)
++{
++    if (watched == m_imageWindow && m_nativeExecuting && m_nativeInside
++        && (event->type() == QEvent::UpdateRequest || event->type() == QEvent::Paint)) {
++        clearNativeImage();
++        return true;
++    }
++    if (watched != m_window || !m_grid || m_token.isEmpty()) return false;
++    if (event->type() == QEvent::DragLeave) {
++        updateNativeImage(false);
++        Q_EMIT left(m_token);
++        return true;
++    }
++    if (event->type() != QEvent::DragEnter && event->type() != QEvent::DragMove && event->type() != QEvent::Drop) return false;
++    auto *drop = static_cast<QDropEvent *>(event);
++    if (!drop->mimeData()) return false;
++    if (QString::fromUtf8(drop->mimeData()->data(QLatin1String(s_mime))) != m_token) return false;
++    const QString token = m_token;
++    const QPointF point = m_grid->mapFromScene(drop->position());
++    const bool inside = m_grid->isVisible() && m_grid->isEnabled()
++        && QRectF(QPointF(), m_grid->size()).contains(point);
++    updateNativeImage(inside);
++    if (!inside) {
++        Q_EMIT left(token);
++        // Keep enter routing across the source panel so a drag can enter another component before returning to the tray.
++        // Releasing outside the tray never commits an order.
++        if (event->type() == QEvent::DragEnter) {
++            drop->setDropAction(Qt::MoveAction);
++            drop->accept();
++        } else {
++            drop->ignore();
++        }
++        return true;
++    }
++    if (event->type() == QEvent::Drop) Q_EMIT dropped(token, point);
++    else Q_EMIT moved(token, point);
++    // A synchronous drop handler may invalidate the current gesture.
++    if (m_token != token || !m_grid) drop->ignore();
++    else {
++        drop->setDropAction(Qt::MoveAction);
++        drop->accept();
++    }
++    return true;
++}
+diff --git a/applets/systemtray/ptmdroprouter.h b/applets/systemtray/ptmdroprouter.h
+new file mode 100644
+index 0000000..44d3540
+--- /dev/null
++++ b/applets/systemtray/ptmdroprouter.h
+@@ -0,0 +1,40 @@
++// SPDX-FileCopyrightText: 2026 Plasma Tray Motion contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#include <QObject>
++#include <QPointer>
++#include <QPointF>
++#include <QString>
++class QQuickItem;
++class QQuickWindow;
++class QRasterWindow;
++
++// Active only during one native gesture in the source panel window,
++// routing this tray private MIME drag events before other panel components intercept them.
++class PtmDropRouter : public QObject
++{
++    Q_OBJECT
++public:
++    explicit PtmDropRouter(QObject *parent = nullptr);
++    ~PtmDropRouter() override;
++    bool begin(QQuickItem *grid, const QString &token);
++    void end(const QString &token);
++    Q_INVOKABLE int runNativeDrag(QObject *imageResult, const QString &token);
++Q_SIGNALS:
++    void nativeDragPrepared(QObject *drag);
++    void moved(const QString &token, const QPointF &point);
++    void left(const QString &token);
++    void dropped(const QString &token, const QPointF &point);
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override;
++private:
++    friend struct PtmDropRouterImageCheck;
++    void updateNativeImage(bool inside);
++    void clearNativeImage();
++    QPointer<QRasterWindow> m_imageWindow;
++    bool m_nativeExecuting = false;
++    bool m_nativeInside = false;
++    QPointer<QQuickWindow> m_window;
++    QPointer<QQuickItem> m_grid;
++    QString m_token;
++};
+diff --git a/applets/systemtray/qml/AbstractItem.qml b/applets/systemtray/qml/AbstractItem.qml
+index b3a80da..467b845 100644
+--- a/applets/systemtray/qml/AbstractItem.qml
++++ b/applets/systemtray/qml/AbstractItem.qml
+@@ -42,6 +42,10 @@ PlasmaCore.ToolTipArea {
+     readonly property int margins: Kirigami.Units.smallSpacing
+     readonly property int maxTextLines: 2
+ 
++    Component.onDestruction: {
++        if (root.ptmController.sourceItem === abstractItem) root.ptmController.cancel();
++    }
++
+     // input agnostic way to trigger the main action
+     signal activated(var pos)
+ 
+@@ -98,6 +102,70 @@ PlasmaCore.ToolTipArea {
+         }
+     }
+ 
++    MouseArea {
++        id: ptmInput
++        anchors.fill: parent
++        z: 10000
++        enabled: abstractItem.inVisibleLayout && Plasmoid.configuration.ptmEnabled
++        acceptedButtons: Qt.LeftButton
++        preventStealing: true
++        property bool held: false
++        property bool moved: false
++        property point origin
++        onPressed: mouse => {
++            held = false;
++            moved = false;
++            origin = Qt.point(mouse.x, mouse.y);
++            abstractItem.hideImmediately();
++            root.ptmController.arm(abstractItem, mouse.x, mouse.y);
++        }
++        onPositionChanged: mouse => {
++            if (!pressed || root.ptmController.nativeRunning) return;
++            const p = mapToItem(root.visibleLayout, mouse.x, mouse.y);
++            root.ptmController.move(p);
++            if (held) {
++                // Use local ordering inside the tray;
++                // hand control to Wayland drag only after the pointer leaves the tray bounds.
++                if (!root.ptmController.inside) root.ptmController.startNative();
++                return;
++            }
++            if (!held && Math.hypot(mouse.x - origin.x, mouse.y - origin.y) > Qt.styleHints.startDragDistance) {
++                moved = true;
++                root.ptmController.disarm();
++            }
++        }
++        onWheel: wheel => { wheel.accepted = false; }
++        onReleased: mouse => {
++            if (root.ptmController.nativeRunning) { held = false; moved = true; return; }
++            const consumed = held || moved;
++            root.ptmController.finish(mapToItem(root.visibleLayout, mouse.x, mouse.y));
++            if (!consumed) {
++                // Defer the original press action until release,
++                // preventing built-in components from opening popups while waiting for a hold.
++                abstractItem.pressed({x: origin.x, y: origin.y,
++                    button: Qt.LeftButton, buttons: Qt.LeftButton,
++                    modifiers: mouse.modifiers, accepted: true,
++                    wasHeld: false, isClick: false});
++                abstractItem.clicked(mouse);
++            }
++            held = false;
++        }
++        onCanceled: {
++            if (!root.ptmController.nativeRunning) root.ptmController.cancel();
++            held = false;
++            moved = true;
++        }
++        Connections {
++            target: root.ptmController
++            function onInteractionCanceled(item) {
++                if (item === abstractItem) ptmInput.moved = true;
++            }
++            function onHoldStarted(item) {
++                if (item === abstractItem) ptmInput.held = true;
++            }
++        }
++    }
++
+     RowLayout {
+         anchors.fill: abstractItem
+         anchors.margins: abstractItem.inHiddenLayout ? abstractItem.margins : 0
+@@ -106,7 +174,9 @@ PlasmaCore.ToolTipArea {
+ 
+         FocusScope {
+             id: iconContainer
+-            scale: (abstractItem.effectivePressed || mouseArea.containsPress) ? 0.8 : 1
++            readonly property bool ptmDragging: abstractItem.inVisibleLayout && root.ptmController.dragIndex >= 0 && root.ptmController.dragIndex === abstractItem.index
++            scale: ptmDragging ? 1.08 : (abstractItem.effectivePressed || mouseArea.containsPress) ? 0.8 : 1
++            opacity: ptmDragging && root.ptmController.nativeRunning && !root.ptmController.inside ? 0 : 1
+ 
+             activeFocusOnTab: !abstractItem.inHiddenLayout
+             focus: true // Required in HiddenItemsView so keyboard events can be forwarded to this item
+diff --git a/applets/systemtray/qml/ConfigGeneral.qml b/applets/systemtray/qml/ConfigGeneral.qml
+index b9d5094..dd7c19e 100644
+--- a/applets/systemtray/qml/ConfigGeneral.qml
++++ b/applets/systemtray/qml/ConfigGeneral.qml
+@@ -29,6 +29,10 @@ KCMUtils.ScrollViewKCM {
+     signal configurationChanged
+     property bool unsavedChanges: !(changedVisibility.size === 0 && changedShortcuts.size === 0)
+ 
++    property bool cfg_ptmEnabled
++    property int cfg_ptmHoldMs
++    property int cfg_ptmAnimationMs
++    property list<string> cfg_ptmItemOrder: []
+     property bool cfg_scaleIconsToFit
+     property int cfg_iconSpacing
+     property bool cfg_reverseIconOrder
+@@ -203,6 +207,29 @@ KCMUtils.ScrollViewKCM {
+ 
+             readonly property int maxComboboxWidth: Math.max(sizeChooser.implicitWidth, spacingChooser.implicitWidth, layoutChooser.implicitWidth)
+ 
++            QQC2.CheckBox {
++                Kirigami.FormData.label: "Plasma Tray Motion:"
++                text: "Hold and drag to reorder"
++                checked: iconsPage.cfg_ptmEnabled
++                onToggled: iconsPage.cfg_ptmEnabled = checked
++            }
++            QQC2.SpinBox {
++                Kirigami.FormData.label: "Hold duration (ms):"
++                from: 100; to: 1500; stepSize: 10
++                value: iconsPage.cfg_ptmHoldMs
++                onValueModified: iconsPage.cfg_ptmHoldMs = value
++            }
++            QQC2.SpinBox {
++                Kirigami.FormData.label: "Reorder animation (ms):"
++                from: 0; to: 500; stepSize: 20
++                value: iconsPage.cfg_ptmAnimationMs
++                onValueModified: iconsPage.cfg_ptmAnimationMs = value
++            }
++            QQC2.Button {
++                text: "Restore KDE default order"
++                onClicked: iconsPage.cfg_ptmItemOrder = []
++            }
++
+             QQC2.ComboBox {
+                 id: sizeChooser
+ 
+diff --git a/applets/systemtray/qml/PtmController.qml b/applets/systemtray/qml/PtmController.qml
+new file mode 100644
+index 0000000..99db16a
+--- /dev/null
++++ b/applets/systemtray/qml/PtmController.qml
+@@ -0,0 +1,289 @@
++// SPDX-FileCopyrightText: 2026 Plasma Tray Motion contributors
++// SPDX-License-Identifier: LGPL-2.0-or-later
++// Plasma Tray Motion: independently implemented on KDE Plasma 6.7.5.
++pragma ComponentBehavior: Bound
++import QtQuick
++import QtQuick.Window
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.plasmoid
++
++Item {
++    id: motion
++    required property GridView grid
++    required property var model
++    required property int iconSize
++    anchors.fill: parent
++    z: 20000
++
++    property var sourceItem: null
++    property int dragIndex: -1
++    property int destination: -1
++    property var slots: []
++    property var ids: []
++    property point pressPosition
++    property point pointerPosition
++    property point delta: Qt.point(0, 0)
++    property bool inside: false
++    property bool nativeRunning: false
++    property bool nativeInvalidated: false
++    property bool dropAccepted: false
++    property var pendingDropOrder: []
++    property var capture: null
++    property int captureSerial: 0
++    property string token: ""
++
++    function completeNative(action) {
++        console.info("[PTM] Native drag finished", action, "accepted", motion.dropAccepted, "invalidated", motion.nativeInvalidated);
++        const commit = action === Qt.MoveAction && !motion.nativeInvalidated
++            && motion.dropAccepted && motion.pendingDropOrder.length > 0;
++        const order = motion.pendingDropOrder.slice();
++        motion.reset();
++        if (commit) console.info("[PTM] Native order commit", Plasmoid.ptmCommitOrder(order));
++    }
++    readonly property int animationMs: Kirigami.Units.longDuration <= 0 ? 0
++        : Math.round(Math.max(0, Math.min(500, Plasmoid.configuration.ptmAnimationMs)) * Kirigami.Units.longDuration / 200)
++    signal holdStarted(var item)
++    signal interactionCanceled(var item)
++
++    function arm(item, x, y) {
++        // Do not let a new gesture overwrite the current transaction before the native event loop exits.
++        if (nativeRunning) return;
++        cancel();
++        if (grid.count < 2) return;
++        sourceItem = item;
++        pressPosition = item.mapToItem(grid, x, y);
++        pointerPosition = pressPosition;
++        token = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
++        const serial = captureSerial;
++        // Capture while waiting for the hold so a deferred image callback does not
++        // start QDrag outside the current mouse event.
++        item.iconContainer.grabToImage(result => {
++            if (serial === motion.captureSerial && motion.sourceItem === item) motion.capture = result;
++        });
++        hold.restart();
++    }
++    function disarm() { hold.stop(); }
++    function cancel(reason = "Canceled") {
++        if (dragIndex >= 0) console.info("[PTM] Drag canceled", reason);
++        if (nativeRunning) {
++            // Wayland manages the drag image until release or Esc; even if the compositor retains it,
++            // invalidate this ordering transaction immediately.
++            nativeInvalidated = true;
++            Plasmoid.ptmUnwatchNativeDrop(token);
++        }
++        reset(nativeRunning);
++    }
++    function reset(keepNative = false) {
++        ++captureSerial;
++        // Cancellation and completion share cleanup; cancellation retains the native lifecycle until it exits.
++        if (!keepNative) {
++            nativeRunning = false;
++            nativeInvalidated = false;
++        }
++        dropAccepted = false;
++        pendingDropOrder = [];
++        capture = null;
++        if (sourceItem) interactionCanceled(sourceItem);
++        hold.stop();
++        dragIndex = -1;
++        destination = -1;
++        sourceItem = null;
++        slots = [];
++        ids = [];
++        delta = Qt.point(0, 0);
++        inside = false;
++    }
++    function begin() {
++        if (!sourceItem || !Plasmoid.configuration.ptmEnabled) return;
++        const positions = [];
++        const names = [];
++        for (let i = 0; i < grid.count; ++i) {
++            const delegate = grid.itemAtIndex(i) as ItemLoader;
++            if (!delegate || !delegate.item || !delegate.model.itemId) { cancel(); return; }
++            const p = delegate.mapToItem(grid, 0, 0);
++            positions.push(Qt.point(p.x, p.y));
++            names.push(delegate.model.itemId);
++        }
++        // Indistinguishable instances with the same ID retain KDE source order;
++        // do not offer per-instance ordering that cannot be persisted reliably.
++        const id = sourceItem.model.itemId;
++        if (names.filter(value => value === id).length !== 1) { cancel(); return; }
++        slots = positions;
++        ids = names;
++        destination = sourceItem.index;
++        dragIndex = sourceItem.index;
++        inside = true;
++        console.info("[PTM] Hold started", dragIndex, "icon count", ids.length);
++        holdStarted(sourceItem);
++        forceActiveFocus(Qt.MouseFocusReason);
++        move(pointerPosition);
++    }
++    function startNative() {
++        if (nativeRunning || dragIndex < 0 || !capture) return;
++        console.info("[PTM] Left tray; starting native drag");
++        if (!Plasmoid.ptmWatchNativeDrop(grid, token)) {
++            console.warn("[PTM] Cannot watch source panel drag events");
++            return;
++        }
++        const nativeToken = token;
++        nativeRunning = true;
++        nativeInvalidated = false;
++        dropAccepted = false;
++        // Call directly from MouseArea.onPositionChanged,
++        // while the left mouse button Wayland serial and implicit grab are still available.
++        try {
++            completeNative(Plasmoid.ptmRunNativeDrag(capture, nativeToken));
++        } finally {
++            Plasmoid.ptmUnwatchNativeDrop(nativeToken);
++            if (motion.nativeRunning) motion.reset();
++        }
++    }
++    function prepareDrop(point) {
++        move(point);
++        if (!nativeRunning || nativeInvalidated || !inside || dragIndex < 0) return false;
++        const order = ids.slice();
++        order.splice(destination, 0, order.splice(dragIndex, 1)[0]);
++        pendingDropOrder = order;
++        dropAccepted = true;
++        return true;
++    }
++    function accepts(event) {
++        return nativeRunning && !nativeInvalidated && dragIndex >= 0
++            && event.getDataAsString("application/x-plasma-tray-motion") === token;
++    }
++    function move(point) {
++        pointerPosition = point;
++        if (dragIndex < 0) return;
++        inside = point.x >= 0 && point.y >= 0 && point.x < grid.width && point.y < grid.height;
++        delta = Qt.point(point.x - pressPosition.x, point.y - pressPosition.y);
++        if (!inside) { destination = dragIndex; return; }
++        let nearest = dragIndex;
++        let distance = Infinity;
++        for (let i = 0; i < slots.length; ++i) {
++            const dx = point.x - slots[i].x - grid.cellWidth / 2;
++            const dy = point.y - slots[i].y - grid.cellHeight / 2;
++            const d = dx * dx + dy * dy;
++            if (d < distance) { distance = d; nearest = i; }
++        }
++        if (destination !== nearest) console.info("[PTM] Order preview", dragIndex, "->", nearest);
++        destination = nearest;
++    }
++    function offsetFor(index) {
++        if (dragIndex < 0 || slots.length !== grid.count) return Qt.point(0, 0);
++        if (index === dragIndex) return nativeRunning && !inside ? Qt.point(0, 0) : delta;
++        let slot = index;
++        if (dragIndex < destination && index > dragIndex && index <= destination) --slot;
++        if (dragIndex > destination && index >= destination && index < dragIndex) ++slot;
++        return Qt.point(slots[slot].x - slots[index].x, slots[slot].y - slots[index].y);
++    }
++    function finish(point) {
++        if (nativeRunning) return;
++        hold.stop();
++        move(point);
++        const from = dragIndex;
++        const to = destination;
++        const commit = from >= 0 && inside && from !== to;
++        const order = ids.slice();
++        if (commit) order.splice(to, 0, order.splice(from, 1)[0]);
++        // Clear the preview before changing the model so model signals cannot cancel the drag being committed.
++        reset();
++        if (commit) console.info("[PTM] Local order commit", Plasmoid.ptmCommitOrder(order));
++    }
++
++    function snapshotMatches() {
++        if (dragIndex < 0) return true;
++        if (grid.count !== ids.length) return false;
++        for (let i = 0; i < ids.length; ++i) {
++            const delegate = grid.itemAtIndex(i) as ItemLoader;
++            if (!delegate || delegate.model.itemId !== ids[i]) return false;
++        }
++        return true;
++    }
++    function checkSnapshot() {
++        if (!snapshotMatches()) cancel("Icon identity or order changed");
++    }
++
++    Timer {
++        id: hold
++        objectName: "ptmHoldTimer"
++        interval: Math.max(100, Math.min(1500, Plasmoid.configuration.ptmHoldMs))
++        onTriggered: motion.begin()
++    }
++    // Only this tray instance accepts its own native drag;
++    // other windows display the compositor image without exported URLs or application actions.
++    DropArea {
++        anchors.fill: parent
++        keys: ["application/x-plasma-tray-motion"]
++        onEntered: event => {
++            event.accepted = motion.accepts(event);
++            console.info("[PTM] Native drag entered tray", event.accepted);
++            if (event.accepted) motion.move(Qt.point(event.x, event.y));
++        }
++        onPositionChanged: event => {
++            event.accepted = motion.accepts(event);
++            if (event.accepted) motion.move(Qt.point(event.x, event.y));
++        }
++        onExited: motion.move(Qt.point(-1, -1))
++        onDropped: event => {
++            console.info("[PTM] Native drop", motion.accepts(event));
++            if (!motion.accepts(event)) { event.accepted = false; return; }
++            if (motion.prepareDrop(Qt.point(event.x, event.y))) event.accept(Qt.MoveAction);
++        }
++    }
++    Connections {
++        target: Plasmoid
++        function onPtmNativeDragMoved(nativeToken, point) {
++            if (motion.nativeRunning && !motion.nativeInvalidated && motion.token === nativeToken) motion.move(point);
++        }
++        function onPtmNativeDragLeft(nativeToken) {
++            if (motion.nativeRunning && motion.token === nativeToken) motion.move(Qt.point(-1, -1));
++        }
++        function onPtmNativeDragDropped(nativeToken, point) {
++            if (motion.nativeRunning && !motion.nativeInvalidated && motion.token === nativeToken) {
++                console.info("[PTM] Panel forwarded drop", motion.prepareDrop(point));
++            }
++        }
++    }
++    Keys.onEscapePressed: event => { cancel(); event.accepted = true; }
++    Shortcut {
++        sequence: "Escape"
++        enabled: motion.dragIndex >= 0 && !motion.nativeRunning
++        context: Qt.ApplicationShortcut
++        onActivated: motion.cancel()
++    }
++    Connections {
++        target: motion.model
++        function onRowsAboutToBeInserted() { motion.cancel(); }
++        function onRowsAboutToBeRemoved() { motion.cancel(); }
++        function onRowsAboutToBeMoved() { motion.cancel(); }
++        function onModelAboutToBeReset() { motion.cancel(); }
++        function onLayoutChanged() {
++            Qt.callLater(motion.checkSnapshot);
++        }
++        function onDataChanged() {
++            // Tooltip, name, and attention animation updates do not change icon membership;
++            // wait for delegate roles to synchronize with the model before checking.
++            Qt.callLater(motion.checkSnapshot);
++        }
++    }
++    Connections {
++        target: motion.Window.window
++        function onVisibleChanged() {
++            if (!motion.Window.window.visible) motion.cancel();
++        }
++    }
++    Connections {
++        target: Plasmoid.configuration
++        function onPtmEnabledChanged() { motion.cancel(); }
++        function onReverseIconOrderChanged() { motion.cancel(); }
++        function onScaleIconsToFitChanged() { motion.cancel(); }
++        function onIconSpacingChanged() { motion.cancel(); }
++    }
++    Connections {
++        target: motion.grid
++        function onWidthChanged() { motion.cancel(); }
++        function onHeightChanged() { motion.cancel(); }
++        function onCellWidthChanged() { motion.cancel(); }
++        function onCellHeightChanged() { motion.cancel(); }
++    }
++}
+diff --git a/applets/systemtray/qml/main.qml b/applets/systemtray/qml/main.qml
+index 1380039..b8ce0a3 100644
+--- a/applets/systemtray/qml/main.qml
++++ b/applets/systemtray/qml/main.qml
+@@ -20,6 +20,8 @@ import org.kde.plasma.plasmoid
+ ContainmentItem {
+     id: root
+ 
++    readonly property alias ptmController: ptmController
++
+     readonly property bool vertical: Plasmoid.formFactor === PlasmaCore.Types.Vertical
+     readonly property bool reverseLayout: Plasmoid.configuration.reverseIconOrder
+ 
+@@ -229,11 +231,27 @@ ContainmentItem {
+                     }
+                 }
+ 
++                PtmController {
++                    id: ptmController
++                    parent: tasksGrid
++                    grid: tasksGrid
++                    iconSize: tasksGrid.itemSize
++                    model: activeModel
++                }
++
+                 model: activeModel
+ 
+                 delegate: ItemLoader {
+                     id: delegate
+ 
++                    readonly property point ptmOffset: ptmController.offsetFor(index)
++                    transform: Translate {
++                        x: delegate.ptmOffset.x
++                        y: delegate.ptmOffset.y
++                        Behavior on x { NumberAnimation { duration: ptmController.dragIndex === delegate.index ? 0 : ptmController.animationMs; easing.type: Easing.OutCubic } }
++                        Behavior on y { NumberAnimation { duration: ptmController.dragIndex === delegate.index ? 0 : ptmController.animationMs; easing.type: Easing.OutCubic } }
++                    }
++                    z: ptmController.dragIndex === index ? 10000 : index + 1
+                     width: tasksGrid.cellWidth
+                     height: tasksGrid.cellHeight
+ 
+diff --git a/applets/systemtray/sortedsystemtraymodel.cpp b/applets/systemtray/sortedsystemtraymodel.cpp
+index d434928..bcbe170 100644
+--- a/applets/systemtray/sortedsystemtraymodel.cpp
++++ b/applets/systemtray/sortedsystemtraymodel.cpp
+@@ -26,6 +26,14 @@ SortedSystemTrayModel::SortedSystemTrayModel(SortingType sorting, QObject *paren
+     sort(0);
+ }
+ 
++void SortedSystemTrayModel::setPtmOrder(const QStringList &order)
++{
++    if (m_ptmOrder != order) {
++        m_ptmOrder = order;
++        invalidate();
++    }
++}
++
+ bool SortedSystemTrayModel::lessThan(const QModelIndex &left, const QModelIndex &right) const
+ {
+     switch (m_sorting) {
+@@ -50,6 +58,30 @@ bool SortedSystemTrayModel::lessThanConfigurationPage(const QModelIndex &left, c
+ 
+ bool SortedSystemTrayModel::lessThanSystemTray(const QModelIndex &left, const QModelIndex &right) const
+ {
++    // Separate visible and hidden subsets first to preserve strict weak ordering for the custom visible order;
++    // the hidden subset continues to use the original KDE comparison rules below.
++    if (!m_ptmOrder.isEmpty()) {
++        const int role = static_cast<int>(BaseModel::BaseRole::EffectiveStatus);
++        const bool leftActive = left.data(role).toInt() == Plasma::Types::ActiveStatus;
++        const bool rightActive = right.data(role).toInt() == Plasma::Types::ActiveStatus;
++        if (leftActive != rightActive) {
++            return leftActive;
++        }
++        if (leftActive) {
++            const int idRole = static_cast<int>(BaseModel::BaseRole::ItemId);
++            int l = m_ptmOrder.indexOf(left.data(idRole).toString());
++            int r = m_ptmOrder.indexOf(right.data(idRole).toString());
++            l = l < 0 ? m_ptmOrder.size() : l;
++            r = r < 0 ? m_ptmOrder.size() : r;
++            if (l != r) {
++                return l < r;
++            }
++            // Keep source order for identical IDs rather than sorting them by title.
++            if (left.data(idRole) == right.data(idRole)) {
++                return left.row() < right.row();
++            }
++        }
++    }
+     QVariant itemIdLeft = left.data(static_cast<int>(BaseModel::BaseRole::ItemId));
+     QVariant itemIdRight = right.data(static_cast<int>(BaseModel::BaseRole::ItemId));
+     if (itemIdRight.toString() == QLatin1String("org.kde.plasma.notifications")) {
+diff --git a/applets/systemtray/sortedsystemtraymodel.h b/applets/systemtray/sortedsystemtraymodel.h
+index 1cca2c7..f2c8536 100644
+--- a/applets/systemtray/sortedsystemtraymodel.h
++++ b/applets/systemtray/sortedsystemtraymodel.h
+@@ -19,6 +19,8 @@ public:
+ 
+     explicit SortedSystemTrayModel(SortingType sorting, QObject *parent = nullptr);
+ 
++    void setPtmOrder(const QStringList &order);
++
+ protected:
+     bool lessThan(const QModelIndex &source_left, const QModelIndex &source_right) const override;
+ 
+@@ -29,5 +31,6 @@ private:
+     int compareCategoriesAlphabetically(const QModelIndex &left, const QModelIndex &right) const;
+     int compareCategoriesOrderly(const QModelIndex &left, const QModelIndex &right) const;
+ 
++    QStringList m_ptmOrder;
+     SortingType m_sorting;
+ };
+diff --git a/applets/systemtray/systemtray.cpp b/applets/systemtray/systemtray.cpp
+index 86fa6f9..dfc431f 100644
+--- a/applets/systemtray/systemtray.cpp
++++ b/applets/systemtray/systemtray.cpp
+@@ -9,6 +9,7 @@
+ #include "config-X11.h"
+ #include "debug.h"
+ #include "systemtray.h"
++#include "ptmdroprouter.h"
+ 
+ #include "plasmoidregistry.h"
+ #include "sortedsystemtraymodel.h"
+@@ -169,6 +170,7 @@ SystemTray::~SystemTray()
+ 
+ void SystemTray::init()
+ {
++    qCInfo(SYSTEM_TRAY) << "Plasma Tray Motion 0.1.9 loaded";
+     // run this before doing any config restore
+     migrateFromSystrayContainer();
+ 
+@@ -201,6 +203,12 @@ void SystemTray::initSettingsAndRegistry()
+     if (!m_settings) {
+         m_settings = new SystemTraySettings(configScheme(), this);
+         connect(m_settings, &SystemTraySettings::enabledPluginsChanged, this, &SystemTray::onEnabledAppletsChanged);
++        connect(m_settings, &SystemTraySettings::configurationChanged, this, [this]() {
++            if (m_sortedSystemTrayModel) {
++                m_sortedSystemTrayModel->setPtmOrder(m_settings->ptmOrder());
++            }
++        });
++        m_settings->migratePtmOrder(config().group(QStringLiteral("General")).readEntry("trayItemOrder", QStringList{}));
+     }
+ 
+     if (!m_plasmoidRegistry) {
+@@ -412,6 +420,56 @@ QPointF SystemTray::popupPosition(QQuickItem *visualParent, int x, int y)
+     return QPoint();
+ }
+ 
++int SystemTray::ptmRunNativeDrag(QObject *imageResult, const QString &token)
++{
++    return m_ptmDropRouter ? m_ptmDropRouter->runNativeDrag(imageResult, token) : int(Qt::IgnoreAction);
++}
++
++bool SystemTray::ptmWatchNativeDrop(QQuickItem *grid, const QString &token)
++{
++    if (!m_ptmDropRouter) {
++        m_ptmDropRouter = new PtmDropRouter(this);
++        connect(m_ptmDropRouter, &PtmDropRouter::moved, this, &SystemTray::ptmNativeDragMoved);
++        connect(m_ptmDropRouter, &PtmDropRouter::left, this, &SystemTray::ptmNativeDragLeft);
++        connect(m_ptmDropRouter, &PtmDropRouter::dropped, this, &SystemTray::ptmNativeDragDropped);
++    }
++    return m_ptmDropRouter->begin(grid, token);
++}
++
++void SystemTray::ptmUnwatchNativeDrop(const QString &token)
++{
++    if (m_ptmDropRouter) m_ptmDropRouter->end(token);
++}
++
++bool SystemTray::ptmCommitOrder(const QStringList &visibleOrder)
++{
++    auto *model = sortedSystemTrayModel();
++    QStringList current;
++    for (int row = 0; row < model->rowCount(); ++row) {
++        const auto idx = model->index(row, 0);
++        if (idx.data(static_cast<int>(BaseModel::BaseRole::EffectiveStatus)).toInt() == Plasma::Types::ActiveStatus) {
++            current.append(idx.data(static_cast<int>(BaseModel::BaseRole::ItemId)).toString());
++        }
++    }
++    auto expected = current;
++    auto received = visibleOrder;
++    expected.sort();
++    received.sort();
++    if (expected != received || visibleOrder.contains(QString()) || current == visibleOrder) {
++        return false;
++    }
++    QStringList saved = visibleOrder;
++    saved.removeDuplicates();
++    for (const auto &id : m_settings->ptmOrder()) {
++        if (!saved.contains(id)) {
++            saved.append(id);
++        }
++    }
++    m_settings->setPtmOrder(saved);
++    Q_EMIT configNeedsSaving();
++    return true;
++}
++
+ bool SystemTray::isSystemTrayApplet(const QString &appletId)
+ {
+     if (m_plasmoidRegistry) {
+@@ -447,6 +505,7 @@ QAbstractItemModel *SystemTray::sortedSystemTrayModel()
+     if (!m_sortedSystemTrayModel) {
+         m_sortedSystemTrayModel = new SortedSystemTrayModel(SortedSystemTrayModel::SortingType::SystemTray, this);
+         m_sortedSystemTrayModel->setSourceModel(systemTrayModel());
++        m_sortedSystemTrayModel->setPtmOrder(m_settings->ptmOrder());
+     }
+     return m_sortedSystemTrayModel;
+ }
+diff --git a/applets/systemtray/systemtray.h b/applets/systemtray/systemtray.h
+index 743f599..8066292 100644
+--- a/applets/systemtray/systemtray.h
++++ b/applets/systemtray/systemtray.h
+@@ -25,6 +25,7 @@ class StatusNotifierModel;
+ class SystemTrayModel;
+ class SortedSystemTrayModel;
+ class KJob;
++class PtmDropRouter;
+ 
+ class SystemTray : public Plasma::Containment
+ {
+@@ -44,6 +45,13 @@ public:
+ 
+     QAbstractItemModel *configSystemTrayModel();
+ 
++    Q_INVOKABLE int ptmRunNativeDrag(QObject *imageResult, const QString &token);
++    Q_INVOKABLE bool ptmWatchNativeDrop(QQuickItem *grid, const QString &token);
++    Q_INVOKABLE void ptmUnwatchNativeDrop(const QString &token);
++
++    // Accept only valid permutations of the current visible icon IDs.
++    Q_INVOKABLE bool ptmCommitOrder(const QStringList &visibleOrder);
++
+     // Invocable utilities
+     /**
+      * Given an AppletInterface pointer, shows a proper context menu for it
+@@ -78,6 +86,11 @@ public:
+ 
+     Q_INVOKABLE void scroll(const QString &service, int delta, const QString &direction);
+ 
++Q_SIGNALS:
++    void ptmNativeDragMoved(const QString &token, const QPointF &point);
++    void ptmNativeDragLeft(const QString &token);
++    void ptmNativeDragDropped(const QString &token, const QPointF &point);
++
+ private Q_SLOTS:
+     // synchronizes with configuration and deletes not allowed applets
+     void onEnabledAppletsChanged();
+@@ -87,6 +100,7 @@ private Q_SLOTS:
+     void stopApplet(const QString &pluginId);
+ 
+ private:
++    PtmDropRouter *m_ptmDropRouter = nullptr;
+     void migrateFromSystrayContainer();
+     SystemTrayModel *systemTrayModel();
+     void initSettingsAndRegistry();
+diff --git a/applets/systemtray/systemtraysettings.cpp b/applets/systemtray/systemtraysettings.cpp
+index 059853a..357e40f 100644
+--- a/applets/systemtray/systemtraysettings.cpp
++++ b/applets/systemtray/systemtraysettings.cpp
+@@ -30,6 +30,28 @@ SystemTraySettings::SystemTraySettings(KConfigLoader *config, QObject *parent)
+     loadConfig();
+ }
+ 
++QStringList SystemTraySettings::ptmOrder() const
++{
++    return config ? config->property(QStringLiteral("ptmItemOrder")).toStringList() : QStringList{};
++}
++
++void SystemTraySettings::setPtmOrder(const QStringList &order)
++{
++    writeConfigValue(QStringLiteral("ptmItemOrder"), order);
++}
++
++void SystemTraySettings::migratePtmOrder(const QStringList &legacy)
++{
++    if (config && !config->property(QStringLiteral("ptmMigrated")).toBool()) {
++        if (ptmOrder().isEmpty() && !legacy.isEmpty()) {
++            QStringList order = legacy;
++            order.removeDuplicates();
++            setPtmOrder(order);
++        }
++        writeConfigValue(QStringLiteral("ptmMigrated"), true);
++    }
++}
++
+ bool SystemTraySettings::isKnownPlugin(const QString &pluginId)
+ {
+     return m_knownItems.contains(pluginId);
+diff --git a/applets/systemtray/systemtraysettings.h b/applets/systemtray/systemtraysettings.h
+index d16782d..682e547 100644
+--- a/applets/systemtray/systemtraysettings.h
++++ b/applets/systemtray/systemtraysettings.h
+@@ -21,6 +21,10 @@ class SystemTraySettings : public QObject
+ public:
+     explicit SystemTraySettings(KConfigLoader *config, QObject *parent = nullptr);
+ 
++    QStringList ptmOrder() const;
++    void setPtmOrder(const QStringList &order);
++    void migratePtmOrder(const QStringList &legacy);
++
+     bool isKnownPlugin(const QString &pluginId);
+     const QStringList knownPlugins() const;
+     void addKnownPlugin(const QString &pluginId);

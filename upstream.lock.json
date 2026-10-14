@@ -1,0 +1,15 @@
+{
+  "url": "https://invent.kde.org/plasma/plasma-workspace.git",
+  "tag": "v6.7.5",
+  "commit": "cc1ab7963f94a9b76836412855caed6b94066188",
+  "source_date_epoch": 1788839412,
+  "archive": "vendor/plasma-workspace-6.7.5-subset.tar.xz",
+  "sha256": "fddf5bc58c5372b8f15d88c1efed3c77b7ec4e9d5cd3d946fc220a384655cf67",
+  "contents": [
+    "applets/systemtray",
+    "libdbusmenuqt",
+    "statusnotifierwatcher",
+    "libkmpris/dbus",
+    "LICENSES"
+  ]
+}
