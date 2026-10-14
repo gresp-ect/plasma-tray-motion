@@ -12,7 +12,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 lock = json.loads((root / 'upstream.lock.json').read_text())
 archive = root / lock['archive']
-assert hashlib.sha256(archive.read_bytes()).hexdigest() == lock['sha256'], 'Upstream source archive verification failed'
+if hashlib.sha256(archive.read_bytes()).hexdigest() != lock['sha256']:
+    raise SystemExit('Upstream source archive verification failed')
 work = root / 'work'
 work.mkdir(exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='ptm-prepare-', dir='/tmp') as temporary:

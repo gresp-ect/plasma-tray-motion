@@ -15,7 +15,7 @@ Only visible icons can be reordered. Moving icons into or out of the hidden sect
 
 ## Compatibility
 
-Version 0.1.9 targets **Fedora 44, Plasma 6.7.5, x86_64, and Wayland**. This project replaces the system tray plugin; it is not a standalone widget or an official KDE extension.
+Version 0.1.9 is a preview for **Fedora 44, Plasma 6.7.5, x86_64, and Wayland**. This project replaces the system tray plugin; it is not a standalone widget or an official KDE extension.
 
 Release packages require the exact runtime RPM versions listed in `manifest.json`. The drag image adapter uses Qt 6.11 private interfaces, so Qt or Plasma updates require review and rebuilding. Do not reuse a binary built for another runtime version.
 
@@ -78,9 +78,10 @@ Run `./diagnose.sh` to collect local diagnostic files. Review their contents bef
 
 ## Development checks
 
-After preparing the sources, run:
+Run the checks from the repository root:
 
 ```bash
+python3 scripts/prepare.py
 python3 scripts/check-native-drag.py
 python3 scripts/check-drop-router.py
 python3 scripts/check-drop-routing.py

@@ -3,6 +3,8 @@
 """Check recovery transactions in a temporary directory without touching the real desktop."""
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
 
@@ -67,3 +69,9 @@ with patch.object(ptm, 'run'), patch.object(ptm, 'output', side_effect=simulated
     else:
         raise AssertionError('A marker for another version must not pass startup verification')
 print('Startup marker checks passed: English marker accepted, mismatched version rejected; no service restarted.')
+
+for arguments in [[], ['--check']]:
+    result = subprocess.run([sys.executable, str(root / 'packaging/ptm.py'), *arguments], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert 'Choose install / uninstall / diagnose' in result.stderr
+print('Command-line checks passed: missing actions are rejected, including with --check.')

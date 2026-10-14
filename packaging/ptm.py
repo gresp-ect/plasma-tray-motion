@@ -313,6 +313,8 @@ def main():
     if args.root_action:
         print(json.dumps(root_action(args.root_action, args.transaction, args.official_plugin)))
         return
+    if args.action is None:
+        parser.error('Choose install / uninstall / diagnose')
     if os.geteuid() == 0:
         raise RuntimeError('Run as the regular desktop user; only plugin writes request sudo.')
     if args.action == 'diagnose':

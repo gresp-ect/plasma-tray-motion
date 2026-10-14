@@ -50,7 +50,8 @@ stock = None
 for line in output(['rpm','-q','--dump','plasma-workspace-libs']).splitlines():
     parts = line.split()
     if parts[0] == '/usr/lib64/qt6/plugins/plasma/applets/org.kde.plasma.systemtray.so': stock = parts[3]
-assert stock and re.fullmatch('[0-9a-f]{64}',stock)
+if not stock or not re.fullmatch('[0-9a-f]{64}', stock):
+    raise SystemExit('Official plugin SHA-256 is missing or invalid in the current RPM.')
 manifest = {'version':'0.1.9','status':'preview','distribution':'fedora','distribution_version':'44','plasma_version':'6.7.5','architecture':'x86_64','upstream':json.loads((root / 'upstream.lock.json').read_text()),'official_sha256':stock,'runtime_packages':versions,'build_tools':{tool:output([tool,'--version']).splitlines()[0] for tool in ['cmake','c++','ninja']},'files':{str(path.relative_to(destination)):digest(path) for path in sorted(destination.rglob('*')) if path.is_file()}}
 (destination / 'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 files = sorted(path for path in destination.rglob('*') if path.is_file())
