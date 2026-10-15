@@ -39,6 +39,28 @@ When editing `work/source`, update the canonical patch before rebuilding. The bu
 
 ## Install
 
+Run this in your regular Wayland desktop terminal (without `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh | bash
+```
+
+To check compatibility before installing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh | bash -s -- --check
+```
+
+The download script pins version 0.1.9 and verifies the release archive's SHA-256 before running the existing installer. It retains the verified package under `${XDG_DATA_HOME:-$HOME/.local/share}/plasma-tray-motion/releases/` and prints the path to `uninstall.sh` for removal or recovery. This does not expand the supported runtime versions listed above. Forward `--official-plugin /path/to/systemtray.so.stock` when a matching official backup is required.
+
+Alternatively, download and inspect the script before running it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh -o ptm-install.sh
+less ptm-install.sh
+bash ptm-install.sh
+```
+
 Extract a release archive and run from its directory as your regular desktop user:
 
 ```bash
