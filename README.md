@@ -2,6 +2,8 @@
 
 Hold-to-drag icon ordering for the KDE Plasma system tray, with live previews and smooth displacement animations.
 
+![Plasma Tray Motion drag-and-drop demo](docs/images/tray-motion-demo.gif)
+
 ## Features
 
 - Reorder visible tray icons and retain their order across Plasma restarts.
