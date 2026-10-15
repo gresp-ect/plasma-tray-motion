@@ -51,12 +51,14 @@ To check compatibility before installing:
 curl -fsSL https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh | bash -s -- --check
 ```
 
+The release download retries connection failures, including interrupted TLS handshakes. If downloading still fails, installation does not start; check your connection to GitHub and rerun the command.
+
 The download script pins version 0.1.9 and verifies the release archive's SHA-256 before running the existing installer. It retains the verified package under `${XDG_DATA_HOME:-$HOME/.local/share}/plasma-tray-motion/releases/` and prints the path to `uninstall.sh` for removal or recovery. This does not expand the supported runtime versions listed above. Forward `--official-plugin /path/to/systemtray.so.stock` when a matching official backup is required.
 
 Alternatively, download and inspect the script before running it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh -o ptm-install.sh
+curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 https://raw.githubusercontent.com/gresp-ect/plasma-tray-motion/main/install.sh -o ptm-install.sh
 less ptm-install.sh
 bash ptm-install.sh
 ```
@@ -110,9 +112,10 @@ python3 scripts/check-native-drag.py
 python3 scripts/check-drop-router.py
 python3 scripts/check-drop-routing.py
 python3 scripts/check-installer.py
+python3 scripts/check-bootstrap.py
 ```
 
-The checks require Qt6 Quick/Test development packages, `qmltestrunner`, and PySide6. They run offscreen or in temporary directories without modifying the desktop.
+The checks require Qt6 Quick/Test development packages, `qmltestrunner`, and PySide6. The bootstrap check also uses curl and the OpenSSL CLI to test TLS retries against a temporary local HTTPS server. They run offscreen or in temporary directories without modifying the desktop.
 
 ## License
 

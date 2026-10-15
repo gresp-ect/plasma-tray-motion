@@ -39,8 +39,14 @@ ptm_dir="$(mktemp -d "$ptm_base/${ptm_version}.XXXXXXXX")"
 ptm_ready=false
 trap 'if [[ "$ptm_ready" == false ]]; then rm -rf -- "$ptm_dir"; fi' EXIT
 printf 'Downloading Plasma Tray Motion %s...\n' "$ptm_version"
-curl --fail --location --show-error --silent --retry 3 --connect-timeout 15 --max-time 300 \
-    --proto '=https' --proto-redir '=https' "$ptm_url" -o "$ptm_dir/package.tar.xz"
+# TLS handshake failures are not retried by --retry alone. Output to a file
+# lets curl discard partial responses before retrying the complete download.
+if ! curl --fail --location --show-error --silent --retry 3 --retry-all-errors \
+    --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+    --proto '=https' --proto-redir '=https' "$ptm_url" -o "$ptm_dir/package.tar.xz"; then
+    echo 'Error: release download failed after retries; installation has not started. Check your connection to GitHub and try again.' >&2
+    exit 1
+fi
 printf '%s  %s\n' "$ptm_sha256" "$ptm_dir/package.tar.xz" | sha256sum --check --status || {
     echo 'Error: release SHA-256 verification failed; refusing to install.' >&2
     exit 1
